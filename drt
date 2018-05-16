@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+
+import argparse
+import io
+import json
+import logging
+import sys
+import shutil
+
+import docker_registry as dr
+
+
+def copy_to_file(fsrc,output):
+    if output == '-':
+        fdst = sys.stdout.buffer
+    else:
+        fdst = open(output,'wb')
+
+    shutil.copyfileobj(fsrc,fdst)
+
+
+def get_manifest(image,cert,output):
+    img = dr.Image(image,cert=cert)
+    manifest = json.dumps(img.manifest())
+    fsrc     = io.BytesIO(manifest.encode())
+    copy_to_file(fsrc,args.output)
+
+
+def get_config(image,cert,output):
+    img = dr.Image(image,cert=cert)
+    config = json.dumps(img.config())
+    fsrc = io.BytesIO(config.encode())
+    copy_to_file(fsrc,args.output)
+
+
+def get_blob(image,cert,output):
+    img = dr.Image(image,cert=cert)
+    fsrc = dr.get_blob(registry,repo,tag)
+    copy_to_file(fsrc,args.output)
+
+
+def get_labels(image,cert,output):
+    img = dr.Image(image,cert=cert)
+    labels = img.config()['config']['Labels']
+    j = json.dumps(labels).encode()
+    fsrc = io.BytesIO(j)
+    copy_to_file(fsrc,args.output)
+
+
+def rebase(old_image,old_base,
+           new_base,new_image,
+           labels=[],
+           certs=[None,None,None,None],
+           execute=False,
+           print_config=False,
+           print_manifest=False):
+    old_image = dr.Image(old_image,cert=certs[0]).pull_data()
+    old_base  = dr.Image(old_base,cert=certs[1]).pull_data()
+    new_base  = dr.Image(new_base,cert=certs[2]).pull_data()
+
+    if not (old_image and old_base and new_base):
+        logging.error('Unable to create %s',new_image)
+        return None
+
+    (ni_reg,ni_repo,ni_tag) = dr.split_fqn(new_image)
+    image = dr.rebase(old_image,old_base,new_base,labels=labels)
+    if not image:
+        return None
+
+    image.registry(ni_reg)
+    image.repo(ni_repo)
+    image.tag(ni_tag)
+    image.cert(certs[3])
+
+    if print_config:
+        config = json.dumps(image.config())
+        print(config)
+    if print_manifest:
+        manifest = json.dumps(image.manifest())
+        print(manifest)
+
+    if execute:
+        logging.info('Pushing %s config',new_image)
+        image.put_config()
+
+        logging.info('Pushing %s blobs',new_image)
+        image.transfer_blobs([old_image,new_base],force_mirror=True)
+
+        logging.info('Pushing %s manifest',new_image)
+        image.put_manifest()
+
+
+def check_image_name(name):
+    n = dr.split_fqn(name)
+    if not n:
+        msg = '{} does not appear to be a fully qualified image name'
+        msg = msg.format(name)
+        raise argparse.ArgumentTypeError(msg)
+    return name
+
+
+def check_kv(kv):
+    s = kv.split('=')
+    if len(s) != 2:
+        msg = '{} is not in the key=value form'
+        msg = msg.format(kv)
+        raise argparse.ArgumentTypeError(msg)
+    return s
+
+
+def build_arg_parser():
+    description = 'tool to work with a docker registry'
+    parser = argparse.ArgumentParser(description=description)
+    parser.set_defaults(verb=None)
+    parser.add_argument('--cert',
+                        dest='cert',
+                        default=[],
+                        action='append',
+                        help='path to ssl client cert file (.pem)')
+
+    subparser = parser.add_subparsers()
+
+    get = subparser.add_parser('get')
+    get.set_defaults(verb='get')
+    get.add_argument('type',
+                     choices=['manifest','config',
+                              'blob','labels'])
+    get.add_argument('image')
+    get.add_argument('-o',
+                     dest='output',
+                     required=True)
+
+
+    put = subparser.add_parser('put')
+    put.set_defaults(verb='put')
+    put.add_argument('type',
+                     choices=['manifest','config','blob'])
+    put.add_argument('image')
+    put.add_argument('-i',
+                     dest='input',
+                     required=True)
+
+
+    rebase = subparser.add_parser('rebase')
+    rebase.set_defaults(verb='rebase')
+    rebase.add_argument('old_image',type=check_image_name)
+    rebase.add_argument('old_base',type=check_image_name)
+    rebase.add_argument('new_base',type=check_image_name)
+    rebase.add_argument('new_image',type=check_image_name)
+    rebase.add_argument('-e',
+                        action='store_true',
+                        help='execute rebase and push',
+                        dest='execute',
+                        default=False)
+    rebase.add_argument('-c',
+                        action='store_true',
+                        help='print rebased image config',
+                        dest='print_config',
+                        default=False)
+    rebase.add_argument('-m',
+                        action='store_true',
+                        help='print rebased image manifest',
+                        dest='print_manifest',
+                        default=False)
+    rebase.add_argument('-l',
+                        type=check_kv,
+                        dest='labels',
+                        default=[],
+                        action='append')
+
+    return parser
+
+
+logging.basicConfig(level=logging.INFO)
+
+p = build_arg_parser()
+args = p.parse_args()
+
+args.cert.extend([None] * 4)
+for i in range(len(args.cert)):
+    if args.cert[i] == "none":
+        args.cert[i] = None
+
+if args.verb == None:
+    p.print_help()
+elif (args.verb == 'get'):
+    if args.type == 'manifest':
+        get_manifest(args.image,args.cert[0],args.output)
+    elif args.type == 'config':
+        get_config(args.image,args.cert[0],args.output)
+    elif args.type == 'blob':
+        get_blob(args.image,args.cert[0],args.output)
+    elif args.type == 'labels':
+        get_labels(args.image,args.cert[0],args.output)
+elif (args.verb == 'put'):
+    pass
+elif (args.verb == 'rebase'):
+    rebase(args.old_image,
+           args.old_base,
+           args.new_base,
+           args.new_image,
+           labels=args.labels,
+           certs=args.cert,
+           execute=args.execute,
+           print_manifest=args.print_manifest,
+           print_config=args.print_config)
